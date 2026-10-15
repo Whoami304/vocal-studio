@@ -1,0 +1,6 @@
+numpy>=1.26,<2.3
+scipy>=1.11
+PyQt6>=6.4
+sounddevice>=0.4.6
+soundfile>=0.12
+pyinstaller>=6.0
