@@ -59,6 +59,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_menu()
         self._connect()
+        self._ensure_default_track()
         self._structure_changed()
 
         self.timer = QTimer(self)
@@ -108,8 +109,7 @@ class MainWindow(QMainWindow):
         self.lbl_project = QLabel("")
         self.lbl_project.setStyleSheet("font-weight: 600;")
         cl.addWidget(self.lbl_project)
-        cl.addWidget(logo)
-        corner.setMinimumWidth(corner.sizeHint().width() + 90)
+        corner.setMinimumWidth(180)
         self.menuBar().setCornerWidget(corner, Qt.Corner.TopRightCorner)
 
         # --- транспорт
@@ -397,10 +397,8 @@ class MainWindow(QMainWindow):
             b.setProperty("done", bool(done[i]))
             b.setProperty("cur", i == cur)
             txt = b.text()
-            if done[i] and not txt.startswith("✓"):
-                b.setText("✓ " + txt[3:].strip() if txt[1:2] == " " or True else txt)
-            elif not done[i] and txt.startswith("✓"):
-                b.setText(["①  Добавьте голос", "②  ✨ Auto-Mix", "③  Послушайте  ▶", "④  Сохраните"][i])
+            labels = ["①  Добавьте голос", "②  ✨ Auto-Mix", "③  Послушайте  ▶", "④  Сохраните"]
+            b.setText(("✓  " + labels[i][3:]) if done[i] else labels[i])
             b.style().unpolish(b)
             b.style().polish(b)
 
@@ -468,10 +466,19 @@ class MainWindow(QMainWindow):
             return self.save_project()
         return r == QMessageBox.StandardButton.Discard
 
+    def _ensure_default_track(self):
+        """Пустой проект сразу содержит готовую дорожку для записи — так понятнее, что делать."""
+        s = self.session
+        if not s.project.tracks:
+            t = s.add_track("vocal")
+            s.set_track_prop(t.id, "arm", True)
+            s.mark_dirty(False)
+
     def new_project(self):
         self.stop_all()
         if self._confirm_discard():
             self.session.new_project()
+            self._ensure_default_track()
             self.seek(0.0)
 
     def open_project(self):
