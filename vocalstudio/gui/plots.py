@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import QSizePolicy, QWidget
 
 from . import theme
 from ..dsp import eq as eqm
-from ..params import MODULES
+from ..plugins import spec_map
 
 FMIN, FMAX = 20.0, 20000.0
 DBR = 18.0
@@ -27,10 +27,11 @@ _BAND_DEFS = [
 ]
 
 
+_EQ_SPECS = spec_map("eq")
+
+
 def _spec(key):
-    for s in MODULES["eq"]["specs"]:
-        if s.key == key:
-            return s
+    return _EQ_SPECS[key]
 
 
 class EQView(QWidget):

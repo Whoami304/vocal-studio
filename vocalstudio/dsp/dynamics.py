@@ -14,6 +14,15 @@ def _block(fs: int) -> int:
     return max(1, int(round(fs / CTRL_RATE)))
 
 
+def _detector(x: np.ndarray, mode: str) -> np.ndarray:
+    """Связанный (linked) детектор для моно/стерео: (ch, n) -> (n,)."""
+    if x.ndim == 1:
+        return x
+    if mode == "rms":
+        return np.sqrt(np.mean(x * x, axis=0))
+    return np.max(np.abs(x), axis=0)
+
+
 def _blocks_peak(x: np.ndarray, B: int):
     n = len(x)
     nb = int(np.ceil(n / B))
@@ -69,7 +78,7 @@ def compressor(x: np.ndarray, fs: int, p: dict) -> tuple[np.ndarray, np.ndarray]
     mix = float(p.get("mix", 100.0)) / 100.0
     mode = "rms" if p.get("detect", "RMS") == "RMS" else "peak"
 
-    L, B = _level_db(x, fs, mode)
+    L, B = _level_db(_detector(x, mode), fs, mode)
     over = L - thr
     slope = 1.0 / ratio - 1.0
     gr = np.zeros_like(over)
@@ -84,7 +93,7 @@ def compressor(x: np.ndarray, fs: int, p: dict) -> tuple[np.ndarray, np.ndarray]
 
     fsc = fs / B
     sm = _smooth(gr, _coef(att, fsc), _coef(rel, fsc))
-    g_db = _to_audio_rate(sm, B, len(x))
+    g_db = _to_audio_rate(sm, B, x.shape[-1])
     g = 10.0 ** ((g_db + makeup) / 20.0)
     y = x * g
     if mix < 0.999:
@@ -97,7 +106,7 @@ def gate(x: np.ndarray, fs: int, p: dict) -> np.ndarray:
     rng = float(p.get("range", 30.0))
     att = float(p.get("attack", 2.0))
     rel = float(p.get("release", 120.0))
-    L, B = _level_db(x, fs, "peak")
+    L, B = _level_db(_detector(x, "peak"), fs, "peak")
     # удержание: открыт, пока в пределах 40 мс был сигнал
     hold = max(1, int(0.04 * fs / B))
     Lh = maximum_filter1d(L, size=hold, mode="nearest")
@@ -105,7 +114,7 @@ def gate(x: np.ndarray, fs: int, p: dict) -> np.ndarray:
     fsc = fs / B
     # закрытие (gain вниз) — release, открытие — attack
     sm = _smooth(gr, _coef(rel, fsc), _coef(att, fsc))
-    return x * 10.0 ** (_to_audio_rate(sm, B, len(x)) / 20.0)
+    return x * 10.0 ** (_to_audio_rate(sm, B, x.shape[-1]) / 20.0)
 
 
 def deesser(x: np.ndarray, fs: int, p: dict) -> tuple[np.ndarray, np.ndarray]:
@@ -113,12 +122,12 @@ def deesser(x: np.ndarray, fs: int, p: dict) -> tuple[np.ndarray, np.ndarray]:
     thr = float(p.get("threshold", -30.0))
     rng = float(p.get("range", 8.0))
     sos = bandpass_sos(fs, f, 1.6)
-    band = sosfilt(sos, x)
-    L, B = _level_db(band, fs, "peak")
+    band = sosfilt(sos, x, axis=-1)
+    L, B = _level_db(_detector(band, "peak"), fs, "peak")
     gr = -np.clip((L - thr) * 0.8, 0.0, rng)
     fsc = fs / B
     sm = _smooth(gr, _coef(0.4, fsc), _coef(25.0, fsc))
-    g_db = _to_audio_rate(sm, B, len(x))
+    g_db = _to_audio_rate(sm, B, x.shape[-1])
     g = 10.0 ** (g_db / 20.0)
     if p.get("wide", False):
         return x * g, g_db
@@ -129,14 +138,15 @@ def deesser(x: np.ndarray, fs: int, p: dict) -> tuple[np.ndarray, np.ndarray]:
 def saturate(x: np.ndarray, fs: int, p: dict) -> np.ndarray:
     drive = 10.0 ** (float(p.get("drive", 6.0)) / 20.0)
     mix = float(p.get("mix", 30.0)) / 100.0
-    xo = resample_poly(x, 2, 1)
+    n = x.shape[-1]
+    xo = resample_poly(x, 2, 1, axis=-1)
     # лёгкая асимметрия -> чётные гармоники ("ламповый" оттенок)
     bias = 0.08 * float(p.get("warmth", 1.0))
     y = np.tanh(drive * xo + bias) - np.tanh(bias)
     y = y / drive
-    y = resample_poly(y, 1, 2)[: len(x)]
-    if len(y) < len(x):
-        y = np.pad(y, (0, len(x) - len(y)))
+    y = resample_poly(y, 1, 2, axis=-1)[..., :n]
+    if y.shape[-1] < n:
+        y = np.pad(y, [(0, 0)] * (y.ndim - 1) + [(0, n - y.shape[-1])])
     return x * (1.0 - mix) + y * mix
 
 

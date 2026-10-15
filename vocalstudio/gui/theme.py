@@ -25,6 +25,7 @@ QSS = f"""
 * {{ font-family: "Segoe UI", "Inter", "Noto Sans", sans-serif; font-size: 12px; color: {TEXT}; }}
 QMainWindow, QDialog, QWidget#root {{ background: {BG}; }}
 QWidget {{ background: transparent; }}
+QDialog, QMessageBox, QInputDialog, QFileDialog {{ background: {BG}; }}
 QToolTip {{ background: {PANEL2}; color: {TEXT}; border: 1px solid {EDGE}; padding: 4px 6px; }}
 
 QFrame#panel {{ background: {PANEL}; border: 1px solid {EDGE}; border-radius: 8px; }}
@@ -83,4 +84,45 @@ QStatusBar {{ background: {PANEL}; border-top: 1px solid {EDGE}; }}
 QGroupBox {{ border: 1px solid {EDGE}; border-radius: 6px; margin-top: 10px; padding-top: 10px; }}
 QGroupBox::title {{ subcontrol-origin: margin; left: 10px; color: {MUTED}; }}
 QSpinBox, QDoubleSpinBox, QLineEdit {{ background: {PANEL2}; border: 1px solid {EDGE}; border-radius: 6px; padding: 4px 6px; }}
+
 """
+
+_EXTRA = """
+QFrame#trackheader { background: #181b23; border: none; border-right: 1px solid #2a2f3b; border-bottom: 1px solid #12151c; }
+QFrame#trackheader[sel="true"] { background: #1d2a2c; border-left: 3px solid %(ACCENT)s; }
+QLabel#trackname { font-size: 13px; font-weight: 700; color: %(TEXT)s; padding-left: 2px; }
+QPushButton#mini, QPushButton#miniarm { background: #232731; border: 1px solid #333a4a; border-radius: 4px; padding: 0; font-size: 11px; font-weight: 700; color: #aeb6c8; }
+QPushButton#mini:hover, QPushButton#miniarm:hover { background: #2d3342; }
+QPushButton#mini:checked, QPushButton#miniarm:checked { background: #3a4660; color: #fff; border-color: #55648a; }
+QPushButton#mini[has="true"] { color: %(ACCENT)s; border-color: #2a5f5a; }
+QPushButton#miniarm:checked { background: #5a1c25; color: #ff6b7a; border-color: %(REC)s; }
+QFrame#pluginrow { background: #20242e; border: 1px solid #2c3140; border-radius: 6px; }
+QFrame#pluginrow:hover { border-color: #3d4456; }
+QFrame#pluginrow[sel="true"] { background: #1f3433; border: 1px solid %(ACCENT)s; }
+QFrame#pluginrow[off="true"] QLabel { color: #5c6478; }
+QLabel#pname { font-size: 12px; font-weight: 700; }
+QPushButton#primary2 { background: #1f3f3b; border: 1px solid %(ACCENT)s; color: %(ACCENT)s; font-weight: 700; padding: 8px 12px; }
+QPushButton#primary2:hover { background: #26524c; }
+QPushButton#magic { background: #3b2a5e; border: 1px solid #a98bff; color: #e4d9ff; font-weight: 700; padding: 8px 12px; }
+QPushButton#magic:hover { background: #4a3578; }
+QPushButton#magic:disabled { background: #1a1d24; border-color: #2a2f3b; color: #566; }
+QPushButton#addtrack { background: transparent; border: 1px dashed #3a4152; color: #8b94a8; padding: 10px 16px; font-weight: 600; }
+QPushButton#addtrack:hover { border-color: %(ACCENT)s; color: %(ACCENT)s; background: #172426; }
+QFrame#banner { background: #1a2230; border: 1px solid #2c3b57; border-radius: 8px; }
+QPushButton#step { background: transparent; border: 1px solid #333a4a; border-radius: 14px; padding: 5px 14px; color: #8b94a8; }
+QPushButton#step:hover { border-color: #55648a; color: %(TEXT)s; }
+QPushButton#step[cur="true"] { background: #1f3f3b; border-color: %(ACCENT)s; color: %(ACCENT)s; font-weight: 700; }
+QPushButton#step[done="true"] { color: %(GREEN)s; border-color: #2c5f3b; }
+QPushButton#close { background: transparent; border: none; color: #7f8799; padding: 2px 8px; }
+QPushButton#close:hover { color: %(TEXT)s; }
+QSplitter::handle { background: #14161b; }
+QSplitter::handle:vertical { height: 6px; }
+QMenuBar { background: %(PANEL)s; border-bottom: 1px solid %(EDGE)s; }
+QMenuBar::item { padding: 5px 10px; background: transparent; }
+QMenuBar::item:selected { background: #2b3040; border-radius: 4px; }
+QTextEdit { background: #10131a; border: 1px solid %(EDGE)s; border-radius: 6px; }
+QRadioButton { spacing: 8px; }
+QRadioButton::indicator { width: 14px; height: 14px; border-radius: 7px; border: 1px solid #3b4254; background: #232731; }
+QRadioButton::indicator:checked { background: %(ACCENT)s; border-color: %(ACCENT)s; }
+""" % dict(ACCENT=ACCENT, TEXT=TEXT, REC=REC, GREEN=GREEN, PANEL=PANEL, EDGE=EDGE)
+QSS += _EXTRA

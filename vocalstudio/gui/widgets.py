@@ -58,8 +58,10 @@ class Knob(QWidget):
         self.accent = QColor(accent)
         self._drag_y = None
         self._drag_pos = 0.0
-        self.setFixedSize(max(size + 14, 70), size + 36)
-        self.setToolTip(spec.tip or spec.label)
+        self.setFixedSize(max(size + 8, 58), size + 36)
+        tip = (spec.tip + "\n" if spec.tip else "") + "Тяните вверх/вниз. Двойной клик — сбросить. Shift — точнее."
+        self.setToolTip(tip)
+        self.setStatusTip((spec.tip or spec.label) + "  (двойной клик — сбросить)")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.WheelFocus)
 
@@ -191,9 +193,9 @@ class NoteKeys(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.mask = [True] * 12
-        self.setMinimumSize(340, 110)
+        self.setMinimumSize(340, 92)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.setFixedHeight(110)
+        self.setFixedHeight(92)
         self.setToolTip("Клик по клавише включает/выключает ноту. Автотюн подтягивает голос только к включённым нотам.")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._hover = -1
