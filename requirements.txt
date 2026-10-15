@@ -1,4 +1,4 @@
-numpy>=1.26,<2.3
+numpy>=1.26
 scipy>=1.11
 PyQt6>=6.4
 sounddevice>=0.4.6
