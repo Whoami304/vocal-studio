@@ -462,7 +462,8 @@ class Session(QObject):
         pr = p["params"]
         pr["key"], pr["scale"] = key_name, scale
         if scale != "Custom":
-            pr["notes"] = scale_mask(NOTE_NAMES.index(key_name), scale)
+            idx = key_name % 12 if isinstance(key_name, int) else NOTE_NAMES.index(key_name)
+            pr["notes"] = scale_mask(idx, scale)
         self.mark_dirty()
         self.plugins_replaced.emit(scope)
         self.request_render()
@@ -647,6 +648,8 @@ class Session(QObject):
                           "tid": tid, "style": style, "vol_db": None, "backing_vol_db": None,
                           "unmask": (2.5 if (audio_tracks and opts.get("space", True)) else None),
                           "bpm": (round(va.backing_tempo[0]) if va.backing_tempo and va.backing_tempo[1] > 0.1 else None)}
+                if result["unmask"]:
+                    result["report"].append("Unmasker: на бит добавлен — он будет слегка приглушаться там, где поёт вокал, чтобы голос был разборчивее.")
                 if apply_levels:
                     self.automix_progress.emit("Балансирую громкость вокала и подложки…")
                     # громкость вокала после цепочки
