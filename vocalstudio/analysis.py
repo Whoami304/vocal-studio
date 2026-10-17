@@ -217,6 +217,7 @@ class VocalAnalysis:
     eq_pres: float = 0.0
     eq_slope: float = -4.5          # дБ/окт
     clip_ratio: float = 0.0
+    breaths: int = 0                # число найденных вдохов
     has_voice: bool = True
     notes: list = field(default_factory=list)
 
@@ -312,6 +313,10 @@ def analyze_vocal(x: np.ndarray, sr: int, track: PitchTrack | None = None, backi
     fit = coef[0] * np.log2(cents) + coef[1]
     va.eq_mud = float(lev[1] - fit[1])      # октава ~250 Гц
     va.eq_pres = float(lev[5] - fit[5])     # октава ~4 кГц
+    try:
+        va.breaths = estimate_breaths(track, x, sr)
+    except Exception:
+        va.breaths = 0
 
     # динамика: порог компрессора и сибилянты — теми же измерителями, что у плагинов
     L, B = dynamics._level_db(dynamics._detector(xa[None, :], "rms"), sr, "rms")
@@ -325,40 +330,67 @@ def analyze_vocal(x: np.ndarray, sr: int, track: PitchTrack | None = None, backi
     return va
 
 
+def estimate_breaths(track: PitchTrack, x: np.ndarray, sr: int) -> int:
+    """Грубый подсчёт вдохов: долгие безголосые участки умеренной громкости без «свистящего» спектра."""
+    from .dsp.pitch import _runs
+    from scipy.signal import butter
+    voiced, rms = track.voiced, track.rms_db
+    if voiced.sum() < 10:
+        return 0
+    hop, F = track.hop, len(track.f0)
+    lvl_v = float(np.percentile(rms[voiced], 60))
+    floor = float(np.percentile(rms, 8))
+    hp = sosfilt(butter(2, 5000.0 / (0.5 * sr), "high", output="sos"), x)
+    n = len(x)
+    pad = max(0, F * hop - n)
+    e_all = np.pad(x * x, (0, pad))[: F * hop].reshape(F, hop).mean(axis=1) + 1e-12
+    e_hf = np.pad(hp * hp, (0, pad))[: F * hop].reshape(F, hop).mean(axis=1) + 1e-12
+    cand = (~voiced) & (rms < lvl_v - 7.0) & (rms > floor + 4.0) & (e_hf / e_all < 0.6)
+    min_len = int(0.16 / (hop / sr))
+    return sum(1 for s_, e_ in _runs(cand) if e_ - s_ >= min_len)
+
+
 # --------------------------------------------------------------- Auto-Mix ---
 
 STYLES = {
     "Natural": dict(
+        rider=dict(range=4), breath=8, exciter=None, doubler=None,
         label="Естественный", desc="Прозрачная обработка, голос звучит как есть, только чище и ровнее.",
         retune=60, humanize=50, flex=30, vibrato=100, ratio_bias=-0.5, comp_attack=14, comp_release=180,
         sat=None, delay=None, reverb=dict(type="Room", decay=0.9, mix=9, predelay=15),
         presence=0.0, air=0.0, vs_backing=-2.0),
     "Pop": dict(
+        rider=dict(range=5), breath=10, exciter=dict(amount=18, freq=6000), doubler=dict(mix=20, voices=2, detune=8),
         label="Поп", desc="Современный блестящий вокал: лёгкий автотюн, воздух, плотная динамика, эхо и реверберация.",
         retune=30, humanize=35, flex=15, vibrato=100, ratio_bias=0.5, comp_attack=10, comp_release=140,
         sat=None, delay=dict(division="1/8", feedback=24, mix=9, pingpong=50),
         reverb=dict(type="Plate", decay=1.5, mix=15, predelay=25), presence=1.0, air=2.0, vs_backing=-1.5),
     "Hard Tune": dict(
+        rider=None, breath=10, exciter=dict(amount=22, freq=5000), doubler=None,
         label="Жёсткий автотюн / Trap", desc="Эффект «робот» (T-Pain): мгновенная коррекция, яркий плотный вокал.",
         retune=0, humanize=0, flex=0, vibrato=0, ratio_bias=1.0, comp_attack=5, comp_release=90,
         sat=dict(drive=6, mix=20), delay=dict(division="1/8", feedback=30, mix=14, pingpong=90),
         reverb=dict(type="Plate", decay=1.2, mix=12, predelay=20), presence=1.5, air=2.5, vs_backing=-1.0),
     "Rap": dict(
+        rider=dict(range=6), breath=12, exciter=dict(amount=20, freq=5500), doubler=dict(mix=16, voices=1, detune=7, delay=22),
         label="Рэп", desc="Плотный и яркий вокал «в лицо»: сильная компрессия, насыщение, короткое пространство.",
         retune=15, humanize=10, flex=0, vibrato=40, ratio_bias=1.5, comp_attack=5, comp_release=80, comp_detect="Peak",
         sat=dict(drive=8, mix=25), delay=dict(division="1/8", feedback=20, mix=10, pingpong=40),
         reverb=dict(type="Room", decay=0.9, mix=8, predelay=10), presence=1.5, air=2.0, vs_backing=0.0),
     "Ballad": dict(
+        rider=dict(range=5), breath=6, exciter=dict(amount=12, freq=6500), doubler=None,
         label="Баллада", desc="Мягкий вокал в большом зале: нежная коррекция, длинная реверберация.",
         retune=55, humanize=55, flex=30, vibrato=105, ratio_bias=-0.3, comp_attack=15, comp_release=200,
         sat=None, delay=dict(division="1/4", feedback=28, mix=10, pingpong=40),
         reverb=dict(type="Hall", decay=3.0, mix=23, predelay=40, damping=60), presence=0.5, air=1.5, vs_backing=-2.5),
     "Dance": dict(
+        rider=None, breath=10, exciter=dict(amount=24, freq=5500), doubler=dict(mix=26, voices=2, detune=11, width=100),
         label="Танцевальный / EDM", desc="Яркий, плотный вокал с ритмичным пинг-понг эхо.",
         retune=20, humanize=20, flex=5, vibrato=80, ratio_bias=1.0, comp_attack=6, comp_release=100,
         sat=None, delay=dict(division="1/4", feedback=35, mix=18, pingpong=100),
         reverb=dict(type="Plate", decay=2.0, mix=19, predelay=30), presence=1.0, air=3.0, vs_backing=-1.0),
     "Clean": dict(
+        rider=dict(range=4), breath=8, exciter=None, doubler=None,
         label="Только чистка", desc="Без автотюна и эффектов: убрать шум и гул, выровнять громкость.",
         retune=None, humanize=40, flex=0, vibrato=100, ratio_bias=-0.5, comp_attack=14, comp_release=180,
         sat=None, delay=None, reverb=None, presence=0.0, air=0.0, vs_backing=-1.5),
@@ -380,6 +412,12 @@ def build_vocal_chain(va: VocalAnalysis, style: str, opts: dict, bpm_default: fl
         report.append(f"Шум в паузах заметен ({va.noise_floor_db:.0f} дБ) — добавлен Noise Gate (порог {thr:.0f} дБ).")
     elif opts["gate"]:
         report.append(f"Запись чистая (шум {va.noise_floor_db:.0f} дБ) — Noise Gate не нужен.")
+
+    # --- breath
+    if opts["gate"] and st.get("breath") and va.breaths >= 2:
+        red = float(np.clip(st["breath"] + (2.0 if va.breaths >= 5 else 0.0), 4.0, 20.0))
+        plugins.append(new_plugin("breath", {"reduction": red}))
+        report.append(f"Найдено вдохов: {va.breaths} — Breath Control приглушит их на {red:.0f} дБ.")
 
     # --- tune
     if opts["tune"] and st["retune"] is not None:
@@ -437,6 +475,12 @@ def build_vocal_chain(va: VocalAnalysis, style: str, opts: dict, bpm_default: fl
         plugins.append(new_plugin("eq", eq))
         report.append("EQ: " + "; ".join(notes) + ".")
 
+    # --- rider (перед компрессором: сначала ровняем фразы, потом сжимаем пики)
+    if opts["dynamics"] and st.get("rider") and va.dyn_range_db > 12.0:
+        rg = float(np.clip(st["rider"]["range"] + (va.dyn_range_db - 14.0) * 0.3, 3.0, 10.0))
+        plugins.append(new_plugin("rider", {"range": round(rg, 1), "target": round(float(np.clip(va.loudness_db, -32.0, -12.0)), 1)}))
+        report.append(f"Vocal Rider: фразы разной громкости ({va.dyn_range_db:.0f} дБ) — буду подравнивать в пределах ±{rg:.0f} дБ.")
+
     # --- compressor
     if opts["dynamics"]:
         dr = va.dyn_range_db
@@ -459,8 +503,14 @@ def build_vocal_chain(va: VocalAnalysis, style: str, opts: dict, bpm_default: fl
 
     # --- насыщение / пространство
     if opts["space"]:
+        if st.get("exciter"):
+            plugins.append(new_plugin("exciter", st["exciter"]))
+            report.append("Exciter: добавлен блеск и «воздух» в верхах.")
         if st["sat"]:
             plugins.append(new_plugin("sat", st["sat"]))
+        if st.get("doubler"):
+            plugins.append(new_plugin("doubler", st["doubler"]))
+            report.append("Doubler: голос расширен лёгким «двойным дублем».")
         if st["delay"]:
             bpm = bpm_default
             if va.backing_tempo is not None and va.backing_tempo[1] > 0.1:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import os
 import sys
@@ -11,7 +12,7 @@ import time
 import numpy as np
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
-from . import analysis
+from . import analysis, editing
 from .dsp.pitch import detect_pitch
 from .dsp.scales import NOTE_NAMES, SCALES, scale_mask
 from .mixer import MixResult, Mixer
@@ -50,6 +51,7 @@ class Session(QObject):
     render_failed = pyqtSignal(str)
     automix_progress = pyqtSignal(str)
     automix_done = pyqtSignal(object)
+    history_changed = pyqtSignal()
     _again = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -70,6 +72,79 @@ class Session(QObject):
         self._timer.setInterval(140)
         self._timer.timeout.connect(self._kick)
         self._again.connect(self._kick)
+        self._undo_stack: list = []
+        self._redo_stack: list = []
+        self._last_key = None
+        self._last_t = 0.0
+        self.clipboard = None            # (audio (C, n) float32)
+
+    # ================================================================ история ==
+    def _capture(self) -> dict:
+        p = self.project
+        return {
+            "tracks": [dataclasses.replace(t, plugins=copy.deepcopy(t.plugins)) for t in p.tracks],
+            "master": copy.deepcopy(p.master), "bpm": p.bpm,
+        }
+
+    def checkpoint(self, coalesce: str | None = None):
+        """Сохраняет состояние проекта перед изменением (для Отменить/Повторить).
+        Одинаковые подряд идущие изменения (ручка, ползунок) за ~1.2 с объединяются в один шаг."""
+        now = time.monotonic()
+        if coalesce is not None and coalesce == self._last_key and now - self._last_t < 1.2:
+            self._last_t = now
+            return
+        self._undo_stack.append(self._capture())
+        del self._undo_stack[:-80]
+        self._redo_stack.clear()
+        self._last_key, self._last_t = coalesce, now
+        self.history_changed.emit()
+
+    @property
+    def can_undo(self) -> bool:
+        return bool(self._undo_stack)
+
+    @property
+    def can_redo(self) -> bool:
+        return bool(self._redo_stack)
+
+    def undo(self) -> bool:
+        if not self._undo_stack:
+            return False
+        self._redo_stack.append(self._capture())
+        self._restore(self._undo_stack.pop())
+        return True
+
+    def redo(self) -> bool:
+        if not self._redo_stack:
+            return False
+        self._undo_stack.append(self._capture())
+        self._restore(self._redo_stack.pop())
+        return True
+
+    def _restore(self, st: dict):
+        p = self.project
+        arms = {t.id: t.arm for t in p.tracks}
+        old_audio = {t.id: (t.audio_id, t.start) for t in p.tracks}
+        p.tracks = [dataclasses.replace(t, plugins=copy.deepcopy(t.plugins), arm=arms.get(t.id, False)) for t in st["tracks"]]
+        p.master = copy.deepcopy(st["master"])
+        p.bpm = st["bpm"]
+        ids = {t.id for t in p.tracks}
+        if self.sel_track not in ids and self.sel_track != MASTER:
+            self.sel_track = p.tracks[0].id if p.tracks else None
+        if self.sel_plugin is not None and self.find_plugin(self.sel_track, self.sel_plugin) is None:
+            self.sel_plugin = None
+        self._last_key = None
+        self.mark_dirty()
+        for t in p.tracks:
+            if old_audio.get(t.id) != (t.audio_id, t.start):
+                self.audio_changed.emit(t.id)
+        self.structure_changed.emit()
+        self.track_changed.emit("*")
+        self.selection_changed.emit()
+        for sc in [MASTER] + [t.id for t in p.tracks]:
+            self.plugins_replaced.emit(sc)
+        self.history_changed.emit()
+        self.request_render(immediate=True)
 
     # ================================================================ доступ ==
     @property
@@ -97,10 +172,10 @@ class Session(QObject):
             self.dirty_changed.emit(d)
 
     # =============================================================== дорожки ==
-    def add_track(self, kind="vocal", name=None, audio=None, source="", select=True) -> Track:
+    def add_track(self, kind="vocal", name=None, audio=None, source="", select=True, start=0) -> Track:
+        self.checkpoint()
         t = self.project.add_track(name, kind, audio, source)
-        if kind == "audio" and audio is not None and audio.shape[0] == 1 and False:
-            pass
+        t.start = int(start)
         if select:
             self.sel_track, self.sel_plugin = t.id, None
         self.mark_dirty()
@@ -112,6 +187,7 @@ class Session(QObject):
         return t
 
     def remove_track(self, tid):
+        self.checkpoint()
         self.project.remove_track(tid)
         if self.sel_track == tid:
             self.sel_track = self.project.tracks[0].id if self.project.tracks else None
@@ -125,8 +201,10 @@ class Session(QObject):
         t = self.project.get(tid)
         if t is None:
             return None
+        self.checkpoint()
         n = self.project.add_track(t.name + " copy", t.kind, t.audio, t.source_name)
         n.audio_id = t.audio_id
+        n.start = t.start
         n.vol_db, n.pan = t.vol_db, t.pan
         n.plugins = [dict(copy.deepcopy(p), id=new_plugin(p["type"])["id"]) for p in t.plugins]
         self.mark_dirty()
@@ -143,58 +221,186 @@ class Session(QObject):
         t = self.project.get(tid)
         if t is None or getattr(t, key) == value:
             return
-        if key == "arm" and value:
-            for o in self.project.tracks:
-                o.arm = (o.id == tid)
+        if key == "arm":
+            if value:
+                for o in self.project.tracks:
+                    o.arm = (o.id == tid)
+            else:
+                t.arm = False
             self.track_changed.emit("*")
-        else:
-            setattr(t, key, value)
-            self.track_changed.emit(tid)
+            return
+        self.checkpoint(f"prop:{tid}:{key}")
+        setattr(t, key, value)
+        self.track_changed.emit(tid)
         self.mark_dirty()
         if key in ("vol_db", "pan", "mute", "solo"):
             self.request_render()
 
     def set_master_vol(self, v):
+        self.checkpoint("master_vol")
         self.project.master["vol_db"] = float(v)
         self.mark_dirty()
         self.track_changed.emit(MASTER)
         self.request_render()
 
-    def set_track_audio(self, tid, audio: np.ndarray | None, source: str = "", keep_undo=True):
+    def set_bpm(self, bpm: float):
+        bpm = float(np.clip(bpm, 30.0, 300.0))
+        if abs(bpm - self.project.bpm) < 1e-6:
+            return
+        self.checkpoint("bpm")
+        self.project.bpm = bpm
+        self.mark_dirty()
+        self.track_changed.emit("*")
+
+    def set_track_audio(self, tid, audio: np.ndarray | None, source: str = "", start: int | None = None):
         t = self.project.get(tid)
         if t is None:
             return
-        if keep_undo and t.audio is not None:
-            t.undo.append((t.audio, t.audio_id, t.source_name))
-            t.undo = t.undo[-6:]
+        self.checkpoint()
         t.audio = None if audio is None else np.ascontiguousarray(audio, dtype=np.float32)
         t.audio_id = new_audio_id() if audio is not None else ""
         t.source_name = source
+        if start is not None:
+            t.start = int(start)
+        elif audio is None:
+            t.start = 0
         self.mark_dirty()
         self.audio_changed.emit(tid)
         self.structure_changed.emit()
         self.request_render(immediate=True)
 
-    def undo_audio(self, tid) -> bool:
+    # ------------------------------------------------------------ запись/правка
+    def record_into_track(self, tid, rec: np.ndarray, start_sample: int, replace_all: bool = False):
+        """Помещает новую запись (моно float32) на дорожку: целиком (новый дубль) или поверх участка (punch-in)."""
         t = self.project.get(tid)
-        if t is None or not t.undo:
-            return False
-        t.audio, t.audio_id, t.source_name = t.undo.pop()
+        if t is None:
+            return
+        self.checkpoint()
+        clip = np.asarray(rec, dtype=np.float32)[None, :]
+        if t.audio is None or replace_all:
+            t.audio, t.start = np.ascontiguousarray(clip), int(start_sample)
+        else:
+            t.audio, t.start = editing.overwrite_into(t.audio, int(start_sample), clip, t.start)
+        t.audio_id = new_audio_id()
+        t.source_name = time.strftime("запись %H:%M:%S")
         self.mark_dirty()
         self.audio_changed.emit(tid)
         self.structure_changed.emit()
         self.request_render(immediate=True)
-        return True
+
+    def move_clip(self, tid, new_start: int):
+        t = self.project.get(tid)
+        if t is None or t.audio is None:
+            return
+        new_start = max(0, int(new_start))
+        if new_start == t.start:
+            return
+        self.checkpoint()
+        t.start = new_start
+        t.audio_id = new_audio_id()      # новый ключ кэша — сдвиг меняет и анализ высоты
+        self.mark_dirty()
+        self.audio_changed.emit(tid)
+        self.structure_changed.emit()
+        self.request_render(immediate=True)
+
+    def _buf_range(self, t: Track, t0: float | None, t1: float | None):
+        """Секунды таймлайна → индексы буфера дорожки. None = вся запись."""
+        n = t.length
+        if t0 is None or t1 is None:
+            return 0, n
+        i0 = int(round(t0 * self.sr)) - t.start
+        i1 = int(round(t1 * self.sr)) - t.start
+        return editing.clamp_range(n, i0, i1)
+
+    def edit_audio(self, tid, op: str, t0: float | None = None, t1: float | None = None, **kw) -> str:
+        """Правка записи на дорожке. Возвращает сообщение для пользователя (пустое — ничего не изменилось).
+        op: delete (со смыканием), silence, cut, copy, trim, fade_in, fade_out, normalize, gain, reverse,
+            trim_silence, paste (kw: at — секунды), clear."""
+        t = self.project.get(tid)
+        if t is None:
+            return "Дорожка не найдена"
+        if op == "paste":
+            if self.clipboard is None:
+                return "Буфер обмена пуст — сначала скопируйте участок (Ctrl+C)"
+            at = int(round(float(kw.get("at", 0.0)) * self.sr))
+            self.checkpoint()
+            t.audio, t.start = editing.mix_into(t.audio, at, self.clipboard, t.start)
+            t.audio_id = new_audio_id()
+            self._after_edit(tid)
+            return f"Вставлено {self.clipboard.shape[1] / self.sr:.2f} с"
+        if t.audio is None:
+            return "На дорожке нет записи"
+        i0, i1 = self._buf_range(t, t0, t1)
+        whole = (t0 is None or t1 is None)
+        if op in ("delete", "silence", "cut", "copy", "trim", "reverse", "gain") and i1 - i0 < 2:
+            return "Сначала выделите участок: проведите мышью по дорожке"
+        a = t.audio
+        msg = ""
+        if op == "copy":
+            self.clipboard = editing.copy_range(a, i0, i1)
+            return f"Скопировано {(i1 - i0) / self.sr:.2f} с"
+        if op == "clear":
+            self.set_track_audio(tid, None)
+            return "Запись удалена с дорожки"
+        self.checkpoint()
+        if op == "cut":
+            self.clipboard = editing.copy_range(a, i0, i1)
+            new = editing.silence_range(a, i0, i1, fade=96)
+            msg = f"Вырезано {(i1 - i0) / self.sr:.2f} с (вставьте Ctrl+V; на месте осталась тишина)"
+        elif op == "silence":
+            new = editing.silence_range(a, i0, i1, fade=96)
+            msg = "Участок заглушён (длина не изменилась)"
+        elif op == "delete":
+            new = editing.delete_range(a, i0, i1)
+            msg = f"Участок удалён, края сомкнуты (−{(i1 - i0) / self.sr:.2f} с)"
+        elif op == "trim":
+            new, off = editing.crop(a, i0, i1)
+            t.start += off
+            msg = "Запись обрезана до выделения"
+        elif op == "fade_in":
+            new = editing.fade(a, i0, i1 if not whole else min(a.shape[1], i0 + int(0.15 * self.sr)), "in")
+            msg = "Нарастание (fade in) применено"
+        elif op == "fade_out":
+            lo = i0 if not whole else max(0, i1 - int(0.15 * self.sr))
+            new = editing.fade(a, lo, i1, "out")
+            msg = "Затухание (fade out) применено"
+        elif op == "normalize":
+            new, g = editing.normalize(a, i0, i1, float(kw.get("peak_db", -1.0)))
+            msg = f"Нормализация: {g:+.1f} дБ"
+        elif op == "gain":
+            new = editing.gain_db(a, i0, i1, float(kw.get("db", 0.0)))
+            msg = f"Усиление {float(kw.get('db', 0.0)):+.1f} дБ"
+        elif op == "reverse":
+            new = editing.reverse(a, i0, i1)
+            msg = "Участок развёрнут"
+        elif op == "trim_silence":
+            new, off = editing.trim_silence(a, float(kw.get("thr_db", -55.0)), sr=self.sr)
+            t.start += off
+            msg = f"Тишина по краям убрана ({a.shape[1] - new.shape[1]} отсчётов)"
+        else:
+            self._undo_stack.pop()
+            return f"Неизвестная операция {op}"
+        t.audio = np.ascontiguousarray(new, dtype=np.float32)
+        t.audio_id = new_audio_id()
+        self._after_edit(tid)
+        return msg
+
+    def _after_edit(self, tid):
+        self.mark_dirty()
+        self.audio_changed.emit(tid)
+        self.structure_changed.emit()
+        self.request_render(immediate=True)
 
     # =============================================================== плагины ==
     def add_plugin(self, scope, ptype, index=None, overrides=None) -> dict:
+        self.checkpoint()
         pl = new_plugin(ptype, overrides)
         lst = self.scope_plugins(scope)
         if index is None:
             lst.append(pl)
         else:
             lst.insert(index, pl)
-        self.sel_track, self.sel_plugin = (scope if scope != MASTER else MASTER), pl["id"]
+        self.sel_plugin = pl["id"]
         self.mark_dirty()
         self.structure_changed.emit()
         self.selection_changed.emit()
@@ -206,6 +412,7 @@ class Session(QObject):
         i = next((k for k, p in enumerate(lst) if p["id"] == pid), None)
         if i is None:
             return
+        self.checkpoint()
         del lst[i]
         if self.sel_plugin == pid:
             self.sel_plugin = lst[min(i, len(lst) - 1)]["id"] if lst else None
@@ -221,6 +428,7 @@ class Session(QObject):
             return
         j = i + delta
         if 0 <= j < len(lst):
+            self.checkpoint()
             lst[i], lst[j] = lst[j], lst[i]
             self.mark_dirty()
             self.structure_changed.emit()
@@ -229,6 +437,7 @@ class Session(QObject):
     def set_plugin_on(self, scope, pid, on):
         p = self.find_plugin(scope, pid)
         if p is not None and p["on"] != bool(on):
+            self.checkpoint()
             p["on"] = bool(on)
             self.mark_dirty()
             self.plugin_changed.emit(scope, pid, "on")
@@ -239,6 +448,7 @@ class Session(QObject):
         p = self.find_plugin(scope, pid)
         if p is None or p["params"].get(key) == value:
             return
+        self.checkpoint(f"param:{pid}:{key}")
         p["params"][key] = value
         self.mark_dirty()
         self.plugin_changed.emit(scope, pid, key)
@@ -248,6 +458,7 @@ class Session(QObject):
         p = self.find_plugin(scope, pid)
         if p is None:
             return
+        self.checkpoint()
         pr = p["params"]
         pr["key"], pr["scale"] = key_name, scale
         if scale != "Custom":
@@ -260,6 +471,7 @@ class Session(QObject):
         p = self.find_plugin(scope, pid)
         if p is None:
             return
+        self.checkpoint()
         pr = p["params"]
         pr["notes"] = list(mask)
         pr["scale"] = "Custom"
@@ -275,12 +487,14 @@ class Session(QObject):
         p = self.find_plugin(scope, pid)
         if p is None:
             return
+        self.checkpoint()
         apply_plugin_preset(p, preset)
         self.mark_dirty()
         self.plugins_replaced.emit(scope)
         self.request_render()
 
     def apply_chain(self, scope, plugins: list):
+        self.checkpoint()
         lst = self.scope_plugins(scope)
         lst[:] = plugins
         self.sel_plugin = plugins[0]["id"] if plugins else None
@@ -302,6 +516,9 @@ class Session(QObject):
         self.mixer.invalidate()
         self.result = None
         self.sel_track = self.sel_plugin = None
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self.history_changed.emit()
         self.project_replaced.emit()
         self.structure_changed.emit()
         self.selection_changed.emit()
@@ -314,6 +531,9 @@ class Session(QObject):
         self.result = None
         self.sel_track = pr.tracks[0].id if pr.tracks else None
         self.sel_plugin = None
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self.history_changed.emit()
         self.project_replaced.emit()
         self.structure_changed.emit()
         self.selection_changed.emit()
@@ -363,7 +583,10 @@ class Session(QObject):
                 self._running = False
                 again = self._pending or (gen != self._gen)
             if again:
-                self._again.emit()
+                try:
+                    self._again.emit()
+                except RuntimeError:   # объект уже удалён при закрытии
+                    pass
 
     def render_blocking(self, snapshot=None) -> MixResult:
         """Синхронный рендер (для экспорта). Ждёт завершения фонового воркера."""
@@ -422,6 +645,7 @@ class Session(QObject):
                 plugins, settings, report = analysis.build_vocal_chain(va, style, opts, bpm_default=bpm)
                 result = {"analysis": va, "plugins": plugins, "settings": settings, "report": report,
                           "tid": tid, "style": style, "vol_db": None, "backing_vol_db": None,
+                          "unmask": (2.5 if (audio_tracks and opts.get("space", True)) else None),
                           "bpm": (round(va.backing_tempo[0]) if va.backing_tempo and va.backing_tempo[1] > 0.1 else None)}
                 if apply_levels:
                     self.automix_progress.emit("Балансирую громкость вокала и подложки…")
@@ -465,6 +689,7 @@ class Session(QObject):
         """Применяет результат Auto-Mix; возвращает данные для отмены."""
         tid = res["tid"]
         t = self.project.get(tid)
+        self.checkpoint()
         undo = {"tid": tid, "plugins": copy.deepcopy(t.plugins), "vol_db": t.vol_db, "pan": t.pan, "bk": {}}
         t.plugins = res["plugins"]
         if res.get("vol_db") is not None:
@@ -476,6 +701,10 @@ class Session(QObject):
                     q.vol_db = q.vol_db + res["backing_vol_db"]
         if res.get("bpm"):
             self.project.bpm = float(res["bpm"])
+        if res.get("unmask"):
+            for q in self.project.tracks:
+                if q.kind == "audio" and q.audio is not None and not any(p["type"] == "unmask" for p in q.plugins):
+                    q.plugins.append(new_plugin("unmask", {"reduction": float(res["unmask"])}))
         self.sel_track = tid
         self.sel_plugin = t.plugins[0]["id"] if t.plugins else None
         self.mark_dirty()
@@ -485,21 +714,9 @@ class Session(QObject):
         self.request_render(immediate=True)
         return undo
 
-    def undo_automix(self, undo: dict):
-        t = self.project.get(undo["tid"])
-        if t is None:
-            return
-        t.plugins = undo["plugins"]
-        t.vol_db, t.pan = undo["vol_db"], undo["pan"]
-        for qid, v in undo["bk"].items():
-            q = self.project.get(qid)
-            if q:
-                q.vol_db = v
-        self.sel_plugin = t.plugins[0]["id"] if t.plugins else None
-        self.structure_changed.emit()
-        self.selection_changed.emit()
-        self.track_changed.emit("*")
-        self.request_render(immediate=True)
+    def undo_automix(self, undo=None):
+        """Отмена Auto-Mix = обычная отмена (шаг истории создан в apply_automix)."""
+        self.undo()
 
     def detect_key_for(self, tid):
         """Определение тональности для кнопки в Auto-Tune: -> dict(key, scale, name, confident, source, ref_a)."""

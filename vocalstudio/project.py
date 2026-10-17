@@ -33,11 +33,16 @@ class Track:
     arm: bool = False
     plugins: list = field(default_factory=list)
     source_name: str = ""
-    undo: list = field(default_factory=list)   # [(audio, audio_id, source_name)]
+    start: int = 0                      # положение записи на таймлайне, отсчёты
 
     @property
     def length(self) -> int:
         return 0 if self.audio is None else self.audio.shape[1]
+
+    @property
+    def end(self) -> int:
+        """Конец записи на таймлайне (отсчёты)."""
+        return 0 if self.audio is None else self.start + self.audio.shape[1]
 
     def mono(self) -> np.ndarray | None:
         if self.audio is None:
@@ -95,7 +100,7 @@ class Project:
         self.dirty = True
 
     def total_samples(self) -> int:
-        return max([t.length for t in self.tracks] + [0])
+        return max([t.end for t in self.tracks] + [0])
 
     # ---- снимок для рендера ------------------------------------------
     def snapshot(self, bypass_all: bool = False) -> dict:
@@ -106,7 +111,7 @@ class Project:
             "master": copy.deepcopy(self.master),
             "tracks": [
                 {
-                    "id": t.id, "audio": t.audio, "audio_id": t.audio_id, "vol_db": t.vol_db, "pan": t.pan,
+                    "id": t.id, "audio": t.audio, "audio_id": t.audio_id, "start": t.start, "vol_db": t.vol_db, "pan": t.pan,
                     "mute": t.mute, "solo": t.solo, "kind": t.kind,
                     "plugins": copy.deepcopy(t.plugins),
                 }
@@ -122,7 +127,8 @@ class Project:
             "tracks": [
                 {"id": t.id, "name": t.name, "kind": t.kind, "color": t.color, "audio_id": t.audio_id,
                  "vol_db": t.vol_db, "pan": t.pan, "mute": t.mute, "solo": t.solo, "arm": t.arm,
-                 "plugins": t.plugins, "source_name": t.source_name, "has_audio": t.audio is not None}
+                 "plugins": t.plugins, "source_name": t.source_name, "has_audio": t.audio is not None,
+                 "start": t.start}
                 for t in self.tracks
             ],
         }
@@ -154,7 +160,7 @@ class Project:
                           audio_id=td.get("audio_id", ""), vol_db=td.get("vol_db", 0.0), pan=td.get("pan", 0.0),
                           mute=td.get("mute", False), solo=td.get("solo", False), arm=False,
                           plugins=[p for p in td.get("plugins", []) if p.get("type") in PLUGINS],
-                          source_name=td.get("source_name", ""))
+                          source_name=td.get("source_name", ""), start=int(td.get("start", 0)))
                 if td.get("has_audio"):
                     with z.open(f"audio/{t.id}.flac") as f:
                         data, fs = sf.read(io.BytesIO(f.read()), dtype="float32", always_2d=True)

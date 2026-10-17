@@ -13,7 +13,7 @@ from typing import Callable
 
 import numpy as np
 
-from .dsp import dynamics, eq as eqm, timefx
+from .dsp import dynamics, eq as eqm, timefx, vocalfx
 from .dsp.autotune import autotune
 from .dsp.scales import NOTE_NAMES, SCALES, scale_mask
 from .params import B, C, F, INPUT_TYPES, Spec
@@ -24,7 +24,8 @@ from .params import B, C, F, INPUT_TYPES, Spec
 class Env:
     """Окружение, которое микшер передаёт плагину при обработке."""
 
-    def __init__(self, sr, cancel=None, progress=None, get_pitch=None):
+    def __init__(self, sr, cancel=None, progress=None, get_pitch=None, sidechain=None):
+        self.sidechain = sidechain
         self.sr = sr
         self.cancel = cancel
         self.progress = progress
@@ -94,6 +95,41 @@ def proc_gain(x, sr, p, env):
     if p.get("mono", False) and y.shape[0] == 2:
         m = y.mean(axis=0)
         y = np.vstack([m, m])
+    return y
+
+
+def _pitch_for(env, mono, p):
+    return env.get_pitch(mono, {"input_type": p.get("input_type", "Auto"), "tracking": p.get("tracking", 50.0)})
+
+
+def proc_breath(x, sr, p, env):
+    mono = _mono(x)
+    return vocalfx.breath_control(x, sr, p, _pitch_for(env, mono, {}))
+
+
+def proc_rider(x, sr, p, env):
+    y, g = vocalfx.vocal_rider(x, sr, p)
+    env.results["gr"] = g[::64]
+    return y
+
+
+def proc_exciter(x, sr, p, env):
+    return vocalfx.exciter(x, sr, p)
+
+
+def proc_doubler(x, sr, p, env):
+    mono = _mono(x)
+    return vocalfx.doubler(x, sr, p, _pitch_for(env, mono, p))
+
+
+def proc_harmony(x, sr, p, env):
+    mono = _mono(x)
+    return vocalfx.harmony(x, sr, p, _pitch_for(env, mono, p))
+
+
+def proc_unmask(x, sr, p, env):
+    y, g = vocalfx.unmasker(x, env.sidechain, sr, p)
+    env.results["gr"] = g
     return y
 
 
@@ -175,7 +211,7 @@ _reg(PluginDef(
         F("amount", "Amount", 0, 100, 100.0, "%", 0, tip="Общая сила эффекта автотюна"),
         F("ref_a", "Ref. A", 415, 466, 440.0, "Hz", 1, tip="Строй: частота ноты ля (440 Гц — стандарт)"),
         C("input_type", "Input Type", INPUT_TYPES, "Auto", "Тип голоса — диапазон поиска высоты"),
-        F("tracking", "Tracking", 0, 100, 40.0, "%", 0, tip="Чувствительность определения высоты. Выше = ловит тихие/шумные участки"),
+        F("tracking", "Tracking", 0, 100, 50.0, "%", 0, tip="Чувствительность определения высоты. Выше = ловит тихие/шумные участки"),
     ],
     proc_tune, extra={"notes": scale_mask(0, "Chromatic"), "overrides": []},
     presets={
@@ -340,6 +376,110 @@ _reg(PluginDef(
     proc_gain, icon="▲",
 ))
 
+
+_reg(PluginDef(
+    "breath", "Breath Control", "Dynamics", "Приглушает громкие вдохи между фразами",
+    "Находит вдохи (длинные безголосые участки) и убавляет их, не трогая «с» и сам голос. Reduction — насколько "
+    "приглушить, Sensitivity — насколько осторожно искать вдохи.",
+    [
+        F("reduction", "Reduction", 0, 40, 12.0, "dB", 1, tip="На сколько децибел приглушить вдохи"),
+        F("sensitivity", "Sensitivity", 0, 100, 50.0, "%", 0, tip="Выше — убирает больше вдохов, но может задеть тихие слоги"),
+    ],
+    proc_breath, presets={"Gentle": {"reduction": 8, "sensitivity": 35}, "Normal": {"reduction": 12, "sensitivity": 50},
+                          "Remove breaths": {"reduction": 28, "sensitivity": 70}},
+    icon="~",
+))
+
+_reg(PluginDef(
+    "rider", "Vocal Rider", "Dynamics", "Сам «двигает ручку громкости» — ровный вокал",
+    "Автоматически подтягивает тихие фразы и убавляет громкие к целевому уровню — как звукорежиссёр, который "
+    "двигает фейдер. Работает мягче компрессора и хорошо сочетается с ним.",
+    [
+        F("target", "Target", -40, -6, -20.0, "dB", 1, tip="Желаемый средний уровень голоса"),
+        F("range", "Range", 0, 18, 8.0, "dB", 1, tip="Максимальная подстройка вверх и вниз"),
+        F("speed", "Speed", 50, 1000, 250.0, "ms", 0, 2.0, tip="Скорость реакции: меньше — быстрее"),
+        F("gate", "Gate", -80, -30, -55.0, "dB", 0, tip="Тише этого уровня (шум, паузы) не усиливать"),
+    ],
+    proc_rider, presets={"Gentle": {"range": 5, "speed": 400}, "Tight": {"range": 12, "speed": 150}},
+    icon="⇅",
+))
+
+_reg(PluginDef(
+    "exciter", "Exciter", "Colour", "Блеск и «воздух» в верхах",
+    "Добавляет приятные верхние гармоники — голос звучит ярче и ближе без грубого подъёма эквалайзером.",
+    [
+        F("freq", "Freq", 2000, 10000, 4500.0, "Hz", 0, log=True, tip="С какой частоты добавлять блеск"),
+        F("amount", "Amount", 0, 100, 25.0, "%", 0, tip="Сколько блеска"),
+    ],
+    proc_exciter, presets={"Subtle air": {"freq": 6000, "amount": 18}, "Bright": {"freq": 3500, "amount": 45}},
+    icon="✦",
+))
+
+_reg(PluginDef(
+    "doubler", "Doubler", "Space", "«Двойной дубль»: голос шире и гуще",
+    "Создаёт копии голоса с лёгкой расстройкой, небольшой задержкой и разной панорамой — как будто вы спели дубль. "
+    "Detune — расстройка, Delay — разница во времени, Width — ширина, Mix — громкость дублей.",
+    [
+        F("voices", "Voices", 1, 4, 2.0, "", 0, tip="Сколько копий"),
+        F("detune", "Detune", 0, 30, 9.0, "ct", 1, tip="Расстройка копий в центах"),
+        F("delay", "Delay", 5, 45, 18.0, "ms", 0, tip="Сдвиг по времени"),
+        F("width", "Width", 0, 100, 80.0, "%", 0, tip="Насколько копии разнесены влево/вправо"),
+        F("mix", "Mix", 0, 100, 35.0, "%", 0, tip="Громкость копий"),
+        F("tracking", "Tracking", 0, 100, 50.0, "%", 0, tip="Чувствительность определения высоты"),
+    ],
+    proc_doubler, presets={"Subtle": {"detune": 6, "mix": 25, "voices": 2}, "Wide": {"detune": 12, "delay": 24, "mix": 45, "width": 100},
+                           "Thick (4 voices)": {"voices": 4, "detune": 10, "mix": 40}},
+    icon="⫴",
+))
+
+_HARM_CHOICES = list(vocalfx.INTERVALS.keys())
+_reg(PluginDef(
+    "harmony", "Harmony", "Pitch", "Подпевка: гармония по тональности",
+    "Создаёт до четырёх голосов гармонии по нотам вашей тональности (терция, квинта, секста, октава), которые "
+    "повторяют вашу мелодию. Выберите ключ и лад (или «Определить»), затем интервалы голосов.",
+    [
+        C("key", "Key", NOTE_NAMES, "C", "Тональность песни"),
+        C("scale", "Scale", list(SCALES.keys()) + ["Custom"], "Major", "Лад"),
+        C("v1_int", "Voice 1", _HARM_CHOICES, "3rd above", "Интервал первого голоса"),
+        F("v1_lvl", "Level", -24, 6, -5.0, "dB", 1), F("v1_pan", "Pan", -100, 100, -45.0, "", 0),
+        C("v2_int", "Voice 2", _HARM_CHOICES, "5th above", "Интервал второго голоса"),
+        F("v2_lvl", "Level", -24, 6, -7.0, "dB", 1), F("v2_pan", "Pan", -100, 100, 45.0, "", 0),
+        C("v3_int", "Voice 3", _HARM_CHOICES, "Off", "Интервал третьего голоса"),
+        F("v3_lvl", "Level", -24, 6, -8.0, "dB", 1), F("v3_pan", "Pan", -100, 100, -20.0, "", 0),
+        C("v4_int", "Voice 4", _HARM_CHOICES, "Off", "Интервал четвёртого голоса"),
+        F("v4_lvl", "Level", -24, 6, -8.0, "dB", 1), F("v4_pan", "Pan", -100, 100, 20.0, "", 0),
+        F("mix", "Mix", 0, 100, 55.0, "%", 0, tip="Общая громкость гармонии"),
+        F("formant", "Formant", -6, 6, 0.0, "st", 1, tip="Сдвиг тембра голосов гармонии"),
+        F("timing", "Timing", 0, 40, 12.0, "ms", 0, tip="Естественная неточность по времени"),
+        F("drift", "Drift", 0, 20, 6.0, "ct", 1, tip="Естественная неточность по высоте"),
+        F("ref_a", "Ref. A", 415, 466, 440.0, "Hz", 1),
+        C("input_type", "Input Type", INPUT_TYPES, "Auto"),
+        F("tracking", "Tracking", 0, 100, 50.0, "%", 0),
+    ],
+    proc_harmony, extra={"notes": scale_mask(0, "Major")},
+    presets={
+        "Pop 3rd + 5th": {"v1_int": "3rd above", "v2_int": "5th above", "v3_int": "Off", "v4_int": "Off"},
+        "Low octave double": {"v1_int": "Octave below", "v2_int": "Off", "v3_int": "Off", "v4_int": "Off", "mix": 45},
+        "Choir (4 voices)": {"v1_int": "3rd above", "v2_int": "5th above", "v3_int": "3rd below", "v4_int": "Octave above", "mix": 60},
+    },
+    icon="♫",
+))
+
+_reg(PluginDef(
+    "unmask", "Unmasker", "EQ", "Освобождает место голосу в музыке",
+    "Ставится на дорожку с битом. Когда поёт вокал, в музыке слегка приглушается полоса, где они конфликтуют, — "
+    "голос слышен лучше без повышения громкости.",
+    [
+        F("freq", "Freq", 800, 6000, 2500.0, "Hz", 0, log=True, tip="Центр конфликтующей полосы"),
+        F("q", "Q", 0.3, 4, 1.2, "", 2, log=True),
+        F("reduction", "Reduction", 0, 12, 3.0, "dB", 1, tip="Максимальное приглушение музыки"),
+        F("threshold", "Threshold", -60, -10, -38.0, "dB", 0, tip="Уровень голоса, при котором включаться"),
+        F("release", "Release", 40, 600, 140.0, "ms", 0, 2.0),
+    ],
+    proc_unmask, presets={"Gentle": {"reduction": 2}, "Strong": {"reduction": 5, "freq": 2200}},
+    icon="◐",
+))
+
 CATEGORY_ORDER = ["Pitch", "Dynamics", "EQ", "Colour", "Space", "Utility"]
 CATEGORY_TITLES = {
     "Pitch": "Высота тона", "Dynamics": "Динамика", "EQ": "Тембр (EQ)",
@@ -437,6 +577,26 @@ CHAIN_PRESETS: dict[str, Callable[[], list]] = {
         ("comp", {"threshold": -26, "ratio": 6, "attack": 3, "release": 70, "makeup": 7}),
         ("eq", {"hpf_f": 350, "hpf_slope": "24 dB/oct", "lp_on": True, "lp_f": 6500, "b2_f": 1800, "b2_g": 4}),
         ("sat", {"drive": 14, "mix": 55}),
+    ),
+    "Studio Vocal (full chain)": lambda: _chain(
+        ("breath", {"reduction": 10}),
+        ("tune", {"retune": 30, "humanize": 40, "flex": 15}),
+        ("eq", {"hpf_f": 90, "b1_g": -2.5, "b2_g": 1.5}),
+        ("comp", {"threshold": -20, "ratio": 3.2, "attack": 10, "release": 140, "auto_makeup": True, "makeup": 0}),
+        ("rider", {"range": 5}),
+        ("deess", None),
+        ("exciter", {"amount": 18, "freq": 6000}),
+        ("doubler", {"mix": 22}),
+        ("delay", {"mix": 9, "feedback": 26}),
+        ("reverb", {"type": "Plate", "decay": 1.5, "mix": 14}),
+    ),
+    "Pop with Harmony": lambda: _chain(
+        ("tune", {"retune": 25, "humanize": 30}),
+        ("eq", {"hpf_f": 90, "b2_g": 2.0, "hs_g": 3.0}),
+        ("comp", {"threshold": -20, "ratio": 3.5, "attack": 10, "release": 140, "makeup": 4}),
+        ("deess", None),
+        ("harmony", None),
+        ("reverb", {"type": "Plate", "decay": 1.6, "mix": 16}),
     ),
     "Clean (EQ + Compressor)": lambda: _chain(
         ("eq", {"hpf_f": 90}),

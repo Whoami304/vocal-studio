@@ -31,6 +31,24 @@ class TimelineState(QObject):
         self.duration = 20.0
         self.view_w = 800
         self.follow = True
+        self.sel_tid = None
+        self.sel_t0 = 0.0
+        self.sel_t1 = 0.0
+
+    # --- выделение (участок записи на дорожке) ---
+    @property
+    def has_selection(self) -> bool:
+        return self.sel_tid is not None and self.sel_t1 - self.sel_t0 > 0.005
+
+    def set_selection(self, tid, t0, t1):
+        t0, t1 = sorted((float(t0), float(t1)))
+        self.sel_tid, self.sel_t0, self.sel_t1 = tid, max(0.0, t0), max(0.0, t1)
+        self.changed.emit()
+
+    def clear_selection(self):
+        if self.sel_tid is not None:
+            self.sel_tid = None
+            self.changed.emit()
 
     def x(self, t):
         return (t - self.t0) * self.pps
@@ -101,9 +119,14 @@ def wave_columns(pyr: WavePyramid, t0_samp: float, spp: float, W: int):
 
 
 class Lane(QWidget):
-    """Дорожка со звуковой волной."""
+    """Дорожка со звуковой волной: выделение мышью, перемещение записи (Alt+перетаскивание), контекстное меню."""
     clicked = pyqtSignal(str)
     files_dropped = pyqtSignal(str, list)
+    context_requested = pyqtSignal(str, object, float)     # tid, глобальная точка, время
+    clip_moved = pyqtSignal(str, float)                    # tid, новое начало (сек)
+    select_all_requested = pyqtSignal(str)
+
+    EDGE = 6
 
     def __init__(self, tid: str, state: TimelineState, color: str, master=False, parent=None):
         super().__init__(parent)
@@ -116,6 +139,7 @@ class Lane(QWidget):
         self.pyr = WavePyramid(None)
         self.audio_id = None
         self.sr = 44100
+        self.start = 0.0            # начало записи на таймлайне, сек
         self.selected = False
         self.armed = False
         self.muted = False
@@ -124,19 +148,26 @@ class Lane(QWidget):
         self._pix = None
         self._pkey = None
         self.setAcceptDrops(True)
-        self.setMouseTracking(False)
-        self._seeking = False
+        self.setMouseTracking(True)
+        self._mode = None
+        self._press_x = 0.0
+        self._press_t = 0.0
+        self._dragged = False
+        self._move_t0 = 0.0
+        self.preview = 0.0
 
     def set_color(self, c):
         self.color = QColor(c)
         self._pkey = None
         self.update()
 
-    def set_audio(self, mono, audio_id, sr):
-        if audio_id != self.audio_id or audio_id is None:
+    def set_audio(self, mono, audio_id, sr, start_sec=0.0):
+        if audio_id != self.audio_id or audio_id is None or abs(start_sec - self.start) > 1e-9:
             self.audio_id = audio_id
-            self.pyr = WavePyramid(mono)
+            if mono is not None or self.pyr.n:
+                self.pyr = WavePyramid(mono)
             self.sr = sr
+            self.start = start_sec
             self._pkey = None
             self.update()
 
@@ -144,19 +175,90 @@ class Lane(QWidget):
         self._pkey = None
         self.update()
 
-    # --- события --------------------------------------------------------
+    def _clip_range(self):
+        if self.pyr.n == 0:
+            return None
+        return self.start, self.start + self.pyr.n / self.sr
+
+    # --- мышь ----------------------------------------------------------------
+    def _near_edge(self, x):
+        st = self.state
+        if st.sel_tid != self.tid or not st.has_selection:
+            return None
+        x0, x1 = st.x(st.sel_t0), st.x(st.sel_t1)
+        if abs(x - x0) <= self.EDGE:
+            return "left"
+        if abs(x - x1) <= self.EDGE:
+            return "right"
+        return None
+
     def mousePressEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit(self.tid)
-            self._seeking = True
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        self.clicked.emit(self.tid)
+        if self.master:
+            self._mode = "seek"
             self.state.seek_requested.emit(max(0.0, self.state.t_at(e.position().x())))
+            return
+        x = e.position().x()
+        t = self.state.t_at(x)
+        edge = self._near_edge(x)
+        if (e.modifiers() & Qt.KeyboardModifier.AltModifier) and self._clip_range() is not None:
+            self._mode = "move"
+            self._move_t0 = t
+            self.preview = 0.0
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        elif edge:
+            self._mode = "edge_" + edge
+        else:
+            self._mode = "select"
+            self._press_x, self._press_t, self._dragged = x, t, False
 
     def mouseMoveEvent(self, e):
-        if self._seeking:
-            self.state.seek_requested.emit(max(0.0, self.state.t_at(e.position().x())))
+        x = e.position().x()
+        t = max(0.0, self.state.t_at(x))
+        st = self.state
+        if self._mode == "move":
+            self.preview = max(t - self._move_t0, -self.start)
+            self.update()
+        elif self._mode == "select":
+            if abs(x - self._press_x) > 4 or self._dragged:
+                self._dragged = True
+                st.set_selection(self.tid, self._press_t, t)
+        elif self._mode == "edge_left":
+            st.set_selection(self.tid, t, st.sel_t1)
+        elif self._mode == "edge_right":
+            st.set_selection(self.tid, st.sel_t0, t)
+        elif self._mode == "seek":
+            st.seek_requested.emit(t)
+        else:
+            if self._near_edge(x):
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            elif e.modifiers() & Qt.KeyboardModifier.AltModifier and self._clip_range() is not None:
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
+            else:
+                self.setCursor(Qt.CursorShape.IBeamCursor if not self.master else Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, e):
-        self._seeking = False
+        st = self.state
+        if self._mode == "move":
+            self.clip_moved.emit(self.tid, self.start + self.preview)
+            self.preview = 0.0
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.update()
+        elif self._mode == "select" and not self._dragged:
+            st.clear_selection()
+            st.seek_requested.emit(max(0.0, self._press_t))
+        self._mode = None
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and not self.master and self._clip_range() is not None:
+            a, b = self._clip_range()
+            self.state.set_selection(self.tid, a, b)
+
+    def contextMenuEvent(self, e):
+        self.clicked.emit(self.tid)
+        self.context_requested.emit(self.tid, e.globalPos(), max(0.0, self.state.t_at(e.pos().x())))
 
     def wheelEvent(self, e):
         d = e.angleDelta().y() or e.angleDelta().x()
@@ -179,11 +281,12 @@ class Lane(QWidget):
         if urls:
             self.files_dropped.emit(self.tid, urls)
 
-    # --- рисование ------------------------------------------------------
+    # --- рисование ---------------------------------------------------------
     def _render_cache(self):
-        W, H = self.width(), self.height()
+        W, H = max(1, self.width()), max(1, self.height())
         key = (W, H, round(self.state.t0, 4), round(self.state.pps, 3), self.audio_id, self.color.name(),
-               self.pyr.n, self.live is not None and len(self.live[0]), self.live and self.live[1], self.muted)
+               self.pyr.n, self.live is not None and len(self.live[0]), self.live and self.live[1], self.muted,
+               round(self.start, 4))
         if key == self._pkey and self._pix is not None:
             return self._pix
         pm = QPixmap(W, H)
@@ -191,7 +294,6 @@ class Lane(QWidget):
         p = QPainter(pm)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         st = self.state
-        # сетка по секундам
         step = _grid_step(st.pps)
         t = math.floor(st.t0 / step) * step
         p.setPen(QPen(QColor(255, 255, 255, 12), 1))
@@ -207,9 +309,8 @@ class Lane(QWidget):
         col = QColor(self.color)
         if self.muted:
             col = QColor("#5a6072")
-        # клип
         if self.pyr.n > 0:
-            x1, x2 = st.x(0.0), st.x(self.pyr.n / self.sr)
+            x1, x2 = st.x(self.start), st.x(self.start + self.pyr.n / self.sr)
             r = QRectF(max(-5, x1), 5, min(W + 5, x2) - max(-5, x1), H - 10)
             if r.width() > 0:
                 bg = QColor(col)
@@ -217,7 +318,7 @@ class Lane(QWidget):
                 p.setPen(QPen(QColor(col.red(), col.green(), col.blue(), 140), 1))
                 p.setBrush(bg)
                 p.drawRoundedRect(r, 5, 5)
-                self._draw_wave(p, self.pyr, st.t0 * self.sr, col, H, int(max(0, x1)), int(min(W, x2)))
+                self._draw_wave(p, self.pyr, (st.t0 - self.start) * self.sr, col, H, int(max(0, x1)), int(min(W, x2)))
         if self.live is not None:
             arr, lt0 = self.live
             if len(arr):
@@ -248,10 +349,30 @@ class Lane(QWidget):
         p.drawPixmap(0, 0, self._render_cache())
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         W, H = self.width(), self.height()
+        st = self.state
         if self.selected:
             p.setPen(QPen(QColor(theme.ACCENT), 1.5))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRect(QRectF(0.75, 0.75, W - 1.5, H - 1.5))
+        # выделение
+        if st.sel_tid == self.tid and st.has_selection:
+            x0, x1 = st.x(st.sel_t0), st.x(st.sel_t1)
+            r = QRectF(max(-2.0, x0), 2, min(W + 2.0, x1) - max(-2.0, x0), H - 4)
+            sel = QColor("#ffe27a")
+            sel.setAlpha(46)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(sel)
+            p.drawRect(r)
+            p.setPen(QPen(QColor("#ffe27a"), 1.5))
+            for xx in (x0, x1):
+                if 0 <= xx <= W:
+                    p.drawLine(QPointF(xx, 2), QPointF(xx, H - 2))
+        if self.preview and self._clip_range() is not None:
+            a, b = self._clip_range()
+            r = QRectF(st.x(a + self.preview), 5, (b - a) * st.pps, H - 10)
+            p.setPen(QPen(QColor("#ffffff"), 1.5, Qt.PenStyle.DashLine))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(r, 5, 5)
         if self.pyr.n == 0 and self.live is None and self.empty_hint:
             f = QFont(self.font())
             f.setPointSizeF(9.5)
@@ -262,7 +383,7 @@ class Lane(QWidget):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(theme.REC))
             p.drawEllipse(QPointF(12, 12), 4, 4)
-        x = self.state.x(self.state.playhead)
+        x = st.x(st.playhead)
         if 0 <= x <= W:
             p.setPen(QPen(QColor("#ffffff"), 1.4))
             p.drawLine(QPointF(x, 0), QPointF(x, H))
@@ -523,6 +644,8 @@ class TracksPanel(QWidget):
     """Линейка + строки дорожек + мастер + скроллбар + кнопки добавления дорожек."""
     request = pyqtSignal(str, str)           # (действие, track_id)
     files_dropped = pyqtSignal(str, list)
+    lane_menu = pyqtSignal(str, object, float)
+    clip_moved = pyqtSignal(str, float)
 
     def __init__(self, session, state: TimelineState, parent=None):
         super().__init__(parent)
@@ -693,12 +816,14 @@ class TracksPanel(QWidget):
             h = TrackHeader(self.s, t)
             l = Lane(t.id, self.state, t.color)
             l.sr = self.s.sr
-            l.set_audio(t.mono(), t.audio_id or None, self.s.sr) if t.audio is not None else None
+            l.set_audio(t.mono(), t.audio_id or None, self.s.sr, t.start / self.s.sr) if t.audio is not None else None
             l.empty_hint = ("Пусто. Нажмите ● чтобы записать голос, или перетащите сюда аудиофайл." if t.kind == "vocal"
                             else "Пусто. Перетащите сюда бит/инструментал или нажмите «Добавить бит».")
             h.action.connect(lambda a, tid: self.request.emit(a, tid))
             l.clicked.connect(lambda tid: self.request.emit("select", tid))
             l.files_dropped.connect(lambda tid, urls: self.files_dropped.emit(tid, urls))
+            l.context_requested.connect(lambda tid, pos, tt: self.lane_menu.emit(tid, pos, tt))
+            l.clip_moved.connect(lambda tid, ts: self.clip_moved.emit(tid, ts))
             row = QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(0)
@@ -736,7 +861,7 @@ class TracksPanel(QWidget):
         t = self.s.track(tid)
         if pair and t:
             h, l = pair
-            l.set_audio(t.mono(), t.audio_id or None, self.s.sr)
+            l.set_audio(t.mono(), t.audio_id or None, self.s.sr, t.start / self.s.sr)
             if t.audio is None:
                 l.pyr = WavePyramid(None)
                 l.audio_id = None

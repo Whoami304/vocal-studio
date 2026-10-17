@@ -215,6 +215,83 @@ class PluginEditor(QFrame):
             self.s.apply_plugin_preset(self.scope, self.pid, {s.key: s.default for s in self.d.specs})
 
 
+# --------------------------------------------------- ключ / лад / ноты ---
+
+class KeyControls(QWidget):
+    """Выбор тональности: Key, Scale, автоопределение, клавиатура нот (используют Auto-Tune и Harmony)."""
+
+    def __init__(self, editor, with_input_type=False, parent=None):
+        super().__init__(parent)
+        self.ed = editor
+        s, b = editor.s, editor.b
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        top = QHBoxLayout()
+        self.key_w = b.combo("key", width=64)
+        self.scale_w = b.combo("scale", width=140)
+        self.key_w.combo.activated.connect(lambda i: s.set_scale(editor.scope, editor.pid, self.key_w.combo.itemText(i), b.value("scale")))
+        self.scale_w.combo.activated.connect(lambda i: s.set_scale(editor.scope, editor.pid, b.value("key"), self.scale_w.combo.itemText(i)))
+        top.addWidget(self.key_w)
+        top.addWidget(self.scale_w)
+        if with_input_type:
+            top.addWidget(b.combo("input_type", width=110))
+        top.addStretch(1)
+        lay.addLayout(top)
+        self.btn_detect = QPushButton("🎯  Определить тональность автоматически")
+        self.btn_detect.setToolTip("Программа послушает ваш вокал (и подложку) и сама выберет ключ и лад")
+        self.btn_detect.setStatusTip("Автоопределение тональности: анализ вашего пения и подложки")
+        self.btn_detect.clicked.connect(self._detect)
+        lay.addWidget(self.btn_detect)
+        self.lbl_detect = QLabel("")
+        self.lbl_detect.setObjectName("muted")
+        self.lbl_detect.setWordWrap(True)
+        lay.addWidget(self.lbl_detect)
+        self.keys = NoteKeys()
+        self.keys.changed.connect(lambda m: s.set_notes(editor.scope, editor.pid, m))
+        lay.addWidget(self.keys)
+        bb = QHBoxLayout()
+        for text, fn in (("Все", lambda: s.set_notes(editor.scope, editor.pid, [True] * 12)),
+                         ("Ничего", lambda: s.set_notes(editor.scope, editor.pid, [False] * 12)),
+                         ("Инверсия", lambda: s.set_notes(editor.scope, editor.pid, [not x for x in b.value("notes")]))):
+            btn = QPushButton(text)
+            btn.setFixedHeight(24)
+            btn.clicked.connect(fn)
+            bb.addWidget(btn)
+        bb.addStretch(1)
+        lay.addLayout(bb)
+        self.setFixedWidth(400)
+
+    def refresh(self):
+        notes = self.ed.b.value("notes")
+        if notes is not None:
+            self.keys.set_mask(notes)
+
+    def _detect(self):
+        ed = self.ed
+        t = ed.s.track(ed.scope) if ed.scope != "master" else None
+        if t is None or t.audio is None:
+            self.lbl_detect.setText("На дорожке нет записи — сначала запишите вокал или откройте файл.")
+            return
+        self.btn_detect.setEnabled(False)
+        self.lbl_detect.setText("Слушаю… определяю тональность")
+
+        def done(res, err):
+            self.btn_detect.setEnabled(True)
+            if err is not None or res is None:
+                self.lbl_detect.setText("Не удалось определить тональность — слишком мало пения. Выберите её вручную.")
+                return
+            ed.s.set_scale(ed.scope, ed.pid, res["key"], res["scale"])
+            extra = ""
+            if "ref_a" in ed.b.specs and res.get("ref_a") and abs(res["ref_a"] - 440.0) > 3:
+                ed.s.set_param(ed.scope, ed.pid, "ref_a", res["ref_a"])
+                extra = f" Строй подложки: {res['ref_a']} Гц — настроил."
+            conf = "" if res["confident"] else " (уверенность невысокая — проверьте на слух)"
+            self.lbl_detect.setText(f"Найдено: {res['name']} — по {res['source']}, уверенность {res['label']}{conf}.{extra}")
+
+        run_async(lambda: ed.s.detect_key_for(ed.scope), done)
+
+
 # ------------------------------------------------------------------ Auto-Tune --
 
 class TuneEditor(PluginEditor):
@@ -229,47 +306,8 @@ class TuneEditor(PluginEditor):
 
         row = QHBoxLayout()
         row.setSpacing(18)
-        left = QVBoxLayout()
-        left.setSpacing(6)
-        top = QHBoxLayout()
-        self.key_w = self.b.combo("key", width=64)
-        self.scale_w = self.b.combo("scale", width=140)
-        self.in_w = self.b.combo("input_type", width=110)
-        self.key_w.combo.activated.connect(lambda i: s.set_scale(self.scope, self.pid, self.key_w.combo.itemText(i),
-                                                                 self.b.value("scale")))
-        self.scale_w.combo.activated.connect(lambda i: s.set_scale(self.scope, self.pid, self.b.value("key"),
-                                                                   self.scale_w.combo.itemText(i)))
-        for w in (self.key_w, self.scale_w, self.in_w):
-            top.addWidget(w)
-        top.addStretch(1)
-        left.addLayout(top)
-        self.btn_detect = QPushButton("🎯  Определить тональность автоматически")
-        self.btn_detect.setToolTip("Программа послушает ваш вокал (и подложку) и сама выберет ключ и лад")
-        self.btn_detect.setStatusTip("Автоопределение тональности: анализ вашего пения и подложки")
-        self.btn_detect.clicked.connect(self._detect)
-        left.addWidget(self.btn_detect)
-        self.lbl_detect = QLabel("")
-        self.lbl_detect.setObjectName("muted")
-        self.lbl_detect.setWordWrap(True)
-        left.addWidget(self.lbl_detect)
-        self.keys = NoteKeys()
-        self.keys.changed.connect(lambda m: s.set_notes(self.scope, self.pid, m))
-        left.addWidget(self.keys)
-        bb = QHBoxLayout()
-        for text, fn in (("Все", lambda: s.set_notes(self.scope, self.pid, [True] * 12)),
-                         ("Ничего", lambda: s.set_notes(self.scope, self.pid, [False] * 12)),
-                         ("Инверсия", lambda: s.set_notes(self.scope, self.pid, [not x for x in self.b.value("notes")]))):
-            b = QPushButton(text)
-            b.setFixedHeight(24)
-            b.clicked.connect(fn)
-            bb.addWidget(b)
-        bb.addStretch(1)
-        left.addLayout(bb)
-        lw = QWidget()
-        lw.setLayout(left)
-        lw.setFixedWidth(400)
-        row.addWidget(lw)
-
+        self.kc = KeyControls(self, with_input_type=True)
+        row.addWidget(self.kc)
         grid = QGridLayout()
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(4)
@@ -290,7 +328,7 @@ class TuneEditor(PluginEditor):
         p = self.s.find_plugin(self.scope, self.pid)
         if p is None:
             return
-        self.keys.set_mask(p["params"]["notes"])
+        self.kc.refresh()
         pr = p["params"]
         self.panel.view.set_mask(pr["notes"], pr["transpose"] + pr["detune"] / 100.0)
 
@@ -298,35 +336,18 @@ class TuneEditor(PluginEditor):
         super().refresh()
         self.refresh_tune()
 
-    def _detect(self):
-        t = self.s.track(self.scope)
-        if t is None or t.audio is None:
-            self.lbl_detect.setText("На дорожке нет записи — сначала запишите вокал или откройте файл.")
-            return
-        self.btn_detect.setEnabled(False)
-        self.lbl_detect.setText("Слушаю… определяю тональность")
-
-        def done(res, err):
-            self.btn_detect.setEnabled(True)
-            if err is not None or res is None:
-                self.lbl_detect.setText("Не удалось определить тональность — слишком мало пения. Выберите её вручную.")
-                return
-            self.s.set_scale(self.scope, self.pid, res["key"], res["scale"])
-            extra = ""
-            if res.get("ref_a") and abs(res["ref_a"] - 440.0) > 3:
-                self.s.set_param(self.scope, self.pid, "ref_a", res["ref_a"])
-                extra = f" Строй подложки: {res['ref_a']} Гц — настроил."
-            conf = "" if res["confident"] else " (уверенность невысокая — проверьте на слух)"
-            self.lbl_detect.setText(f"Найдено: {res['name']} — по {res['source']}, уверенность {res['label']}{conf}.{extra}")
-
-        run_async(lambda: self.s.detect_key_for(self.scope), done)
-
     def set_result(self, res, track_result):
         pv = self.panel.view
         t = self.s.track(self.scope)
-        if t is not None:
-            pv.set_wave(t.mono(), self.s.sr)
-            pv.set_duration(max(t.length, 1) / self.s.sr)
+        if t is not None and t.audio is not None:
+            import numpy as np
+            mono = t.mono()
+            if t.start:
+                mono = np.concatenate([np.zeros(t.start, np.float32), mono])
+            pv.set_wave(mono, self.s.sr)
+            pv.set_duration(max(t.end, 1) / self.s.sr)
+        else:
+            pv.set_wave(None, self.s.sr)
         got = track_result.tune.get(self.pid) if track_result is not None else None
         if got is None:
             pv.set_result(None, None, self.s.sr)
@@ -524,8 +545,101 @@ class ReverbEditor(PluginEditor):
         self.body.addStretch(1)
 
 
+class RiderEditor(PluginEditor):
+    def build(self):
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        for i, k in enumerate(["target", "range", "speed", "gate"]):
+            grid.addWidget(self.b.knob(k, 56, self.ACCENT), 0, i)
+        w = QWidget()
+        w.setLayout(grid)
+        self.body.addWidget(w, 0, Qt.AlignmentFlag.AlignLeft)
+        self.gr = GRTrace("RIDER — как громкость подстраивалась по ходу песни (вверх/вниз)", 12.0)
+        self.gr.setMinimumHeight(70)
+        self.body.addWidget(self.gr, 1)
+
+    def set_result(self, res, track_result):
+        gr = track_result.gr.get(self.pid) if track_result is not None else None
+        self.gr.set_data(gr, self.s.sr)
+
+    def set_playhead(self, t):
+        self.gr.set_playhead(t)
+
+
+class UnmaskEditor(PluginEditor):
+    def build(self):
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        for i, k in enumerate(["freq", "q", "reduction", "threshold", "release"]):
+            grid.addWidget(self.b.knob(k, 56, self.ACCENT), 0, i)
+        w = QWidget()
+        w.setLayout(grid)
+        self.body.addWidget(w, 0, Qt.AlignmentFlag.AlignLeft)
+        tip = QLabel("Нужен вокал на другой дорожке: плагин реагирует на его громкость.")
+        tip.setObjectName("muted")
+        self.body.addWidget(tip)
+        self.gr = GRTrace("UNMASK — где музыка приглушалась под голос", 8.0)
+        self.gr.setMinimumHeight(70)
+        self.body.addWidget(self.gr, 1)
+
+    def set_result(self, res, track_result):
+        gr = track_result.gr.get(self.pid) if track_result is not None else None
+        self.gr.set_data(gr, self.s.sr)
+
+    def set_playhead(self, t):
+        self.gr.set_playhead(t)
+
+
+class HarmonyEditor(PluginEditor):
+    ACCENT = "#c58bff"
+
+    def build(self):
+        row = QHBoxLayout()
+        row.setSpacing(18)
+        self.kc = KeyControls(self)
+        row.addWidget(self.kc, 0, Qt.AlignmentFlag.AlignTop)
+        right = QVBoxLayout()
+        right.setSpacing(6)
+        cap = QLabel("ГОЛОСА ГАРМОНИИ")
+        cap.setObjectName("title")
+        right.addWidget(cap)
+        for k in range(1, 5):
+            r = QHBoxLayout()
+            r.setSpacing(10)
+            cb = self.b.combo(f"v{k}_int", label=False, width=130)
+            lab = QLabel(f"Голос {k}")
+            lab.setFixedWidth(54)
+            r.addWidget(lab)
+            r.addWidget(cb)
+            r.addWidget(self.b.knob(f"v{k}_lvl", 40, self.ACCENT))
+            r.addWidget(self.b.knob(f"v{k}_pan", 40, self.ACCENT))
+            r.addStretch(1)
+            w = QWidget()
+            w.setLayout(r)
+            right.addWidget(w)
+        g = QGridLayout()
+        for i, key in enumerate(["mix", "formant", "timing", "drift", "ref_a", "tracking"]):
+            g.addWidget(self.b.knob(key, 46, self.ACCENT), 0, i)
+        gw = QWidget()
+        gw.setLayout(g)
+        right.addWidget(gw)
+        right.addStretch(1)
+        rw = QWidget()
+        rw.setLayout(right)
+        row.addWidget(rw, 1)
+        w = QWidget()
+        w.setLayout(row)
+        self.body.addWidget(w)
+        self.kc.refresh()
+
+    def refresh(self):
+        super().refresh()
+        self.kc.refresh()
+
+
 EDITORS = {"tune": TuneEditor, "eq": EQEditor, "comp": CompEditor, "deess": DeessEditor,
-           "delay": DelayEditor, "reverb": ReverbEditor}
+           "delay": DelayEditor, "reverb": ReverbEditor, "rider": RiderEditor, "unmask": UnmaskEditor,
+           "harmony": HarmonyEditor}
 
 
 def make_editor(session, scope, plugin) -> PluginEditor:

@@ -118,7 +118,10 @@ def compute_correction(track: PitchTrack, p: dict, overrides=None) -> Correction
             else:
                 off_target = desired[i] - m2[i]
             off_target *= amount
-            tau = retune + humanize * 0.45 * (1.0 - np.exp(-t_on / 0.6))
+            # Humanize замедляет коррекцию на долгих нотах, но не должен смягчать быстрые настройки:
+            # при Retune Speed = 0 влияния нет (жёсткий «хард-тюн»), к 25 мс эффект полный.
+            h_eff = humanize * min(1.0, retune / 0.025)
+            tau = retune + h_eff * 0.45 * (1.0 - np.exp(-t_on / 0.6))
             a = 1.0 if tau <= 1e-4 else 1.0 - np.exp(-dt / tau)
             off += a * (off_target - off)
             out[i] = m2[i] + off
@@ -271,7 +274,7 @@ def psola_shift(
         tout_frames = sr / f_out[s:e]
         ks, ss, Tss = _plan_run(A - s * hop, tout_frames, hop, sr)
         sp = ss + s * hop
-        h = np.minimum(np.round(np.maximum(Pk[ks], 0.9 * Tss)).astype(np.int64), 4000)
+        h = np.minimum(np.round(np.maximum(Pk[ks], np.minimum(0.9 * Tss, 1.25 * Pk[ks]))).astype(np.int64), 4000)
         c = np.round(A[ks]).astype(np.int64)
         delta = A[ks] - c
         cs = np.round(sp).astype(np.int64)

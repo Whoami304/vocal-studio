@@ -426,17 +426,59 @@ class ShortcutsDialog(QDialog):
         self.setWindowTitle("Горячие клавиши")
         lay = QVBoxLayout(self)
         rows = [("Пробел", "Воспроизведение / пауза"), ("R", "Запись на выбранную (armed) дорожку"),
-                ("Home", "В начало"), ("Ctrl+T", "Новая вокальная дорожка"), ("Ctrl+I", "Импорт аудиофайла на новую дорожку"),
+                ("Home / End", "В начало / в конец"), ("Ctrl+T", "Новая вокальная дорожка"),
+                ("Ctrl+I", "Импорт аудиофайла на новую дорожку"),
                 ("Ctrl+M", "Auto-Mix для выбранной дорожки"), ("Ctrl+B", "Original (A/B): послушать без обработки"),
-                ("Ctrl+Z", "Отменить последнюю запись на дорожке"), ("Ctrl+S", "Сохранить проект"),
-                ("Ctrl+O", "Открыть проект"), ("Ctrl+E", "Экспорт"),
+                ("Ctrl+Z / Ctrl+Shift+Z", "Отменить / повторить (запись, правка, плагины)"),
+                ("Ctrl+A", "Выделить весь клип"), ("Ctrl+C / Ctrl+X / Ctrl+V", "Копировать / вырезать / вставить"),
+                ("Delete", "Заглушить выделенное (длина сохраняется)"),
+                ("Shift+Delete", "Удалить выделенное и сдвинуть остальное"),
+                ("Ctrl+Shift+T", "Обрезать клип по выделению"),
+                ("Ctrl+S", "Сохранить проект"), ("Ctrl+O", "Открыть проект"), ("Ctrl+E", "Экспорт"),
+                ("Тянуть мышью по дорожке", "Выделить фрагмент"), ("Alt + тянуть клип", "Переместить клип по времени"),
+                ("Двойной клик по клипу", "Выделить клип целиком"), ("Правая кнопка", "Меню правки"),
                 ("Ctrl+колесо", "Масштаб дорожек по времени"), ("Shift+колесо", "Прокрутка по времени"),
                 ("Двойной клик по ручке", "Сбросить значение")]
         txt = "<table cellpadding='4'>" + "".join(f"<tr><td><b>{a}</b></td><td>{b}</td></tr>" for a, b in rows) + "</table>"
-        l = QLabel(txt)
-        lay.addWidget(l)
+        lay.addWidget(QLabel(txt))
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         bb.rejected.connect(self.reject)
-        bb.accepted.connect(self.accept)
         bb.button(QDialogButtonBox.StandardButton.Close).clicked.connect(self.accept)
         lay.addWidget(bb)
+
+
+class DiagnosticsDialog(QDialog):
+    """Сведения о звуковой системе и журнал ошибок — для быстрой диагностики."""
+
+    def __init__(self, engine=None, parent=None):
+        super().__init__(parent)
+        from . import safety
+        self.setWindowTitle("Диагностика")
+        self.resize(760, 560)
+        lay = QVBoxLayout(self)
+        txt = audio_io.diagnostics_text()
+        if engine is not None:
+            txt += f"\n\nДвижок: режим={engine.mode}, частота потока={engine.fs}, задержка={engine.latency_s * 1000:.0f} мс"
+            if getattr(engine, "last_error", ""):
+                txt += f"\nПоследняя ошибка потока: {engine.last_error}"
+        txt += f"\n\n— Журнал ошибок ({safety.log_path()}) —\n" + (safety.recent_errors() or "ошибок нет")
+        self.text = QTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setPlainText(txt)
+        lay.addWidget(self.text, 1)
+        row = QHBoxLayout()
+        b_copy = QPushButton("Копировать всё")
+        b_copy.clicked.connect(self._copy)
+        b_open = QPushButton("Открыть папку журнала")
+        b_open.clicked.connect(lambda: open_folder(os.path.dirname(safety.log_path())))
+        b_close = QPushButton("Закрыть")
+        b_close.clicked.connect(self.accept)
+        row.addWidget(b_copy)
+        row.addWidget(b_open)
+        row.addStretch(1)
+        row.addWidget(b_close)
+        lay.addLayout(row)
+
+    def _copy(self):
+        from PyQt6.QtWidgets import QApplication
+        QApplication.clipboard().setText(self.text.toPlainText())

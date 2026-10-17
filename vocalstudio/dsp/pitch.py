@@ -173,6 +173,7 @@ def detect_pitch(
     f0 = _median_smooth_log(f0, voiced, 5)
     voiced = _reject_outliers(f0, voiced)
     f0 = np.where(voiced, f0, 0.0)
+    f0, voiced = _extend_runs(f0, voiced, rms_db, gate, 2)
     return PitchTrack(sr=sr, hop=hop, f0=f0, voiced=voiced, conf=conf, rms_db=rms_db)
 
 
@@ -292,3 +293,21 @@ def _reject_outliers(f0: np.ndarray, voiced: np.ndarray, win: int = 21, thr_st: 
         if e - s < 5:
             v[s:e] = False
     return v
+
+
+def _extend_runs(f0: np.ndarray, voiced: np.ndarray, rms_db: np.ndarray, gate: float, n: int = 2):
+    """Продлевает озвончённые серии на n кадров с краёв (если там есть сигнал): начало и конец нот
+    часто теряются детектором, из-за чего их края оставались бы нескорректированными."""
+    f0 = f0.copy()
+    v = voiced.copy()
+    F = len(f0)
+    for s, e in _runs(voiced):
+        for k in range(1, n + 1):
+            i = s - k
+            if i >= 0 and not voiced[i] and rms_db[i] > gate - 6.0:
+                f0[i], v[i] = f0[s], True
+        for k in range(0, n):
+            i = e + k
+            if i < F and not voiced[i] and rms_db[i] > gate - 6.0:
+                f0[i], v[i] = f0[e - 1], True
+    return f0, v

@@ -50,7 +50,7 @@ class Mixer:
         self._pitch.clear()
 
     # ------------------------------------------------------------------
-    def _run_chain(self, scope, x, key, plugins, sr, bypass, cancel, progress, results):
+    def _run_chain(self, scope, x, key, plugins, sr, bypass, cancel, progress, results, sidechain=None, sc_key=""):
         """Прогон цепочки плагинов с кэшем. Возвращает (x, key)."""
         for pl in plugins:
             if cancel is not None and cancel():
@@ -59,12 +59,14 @@ class Mixer:
                 continue
             pid = pl["id"]
             key = _k(key, pl["type"], pl["params"])
+            if pl["type"] == "unmask":
+                key = _k(key, sc_key)
             hit = self._cache.get((scope, pid))
             if hit is not None and hit[0] == key:
                 x = hit[1].astype(np.float64)
                 results[pid] = hit[2]
                 continue
-            env = Env(sr, cancel=cancel, progress=progress)
+            env = Env(sr, cancel=cancel, progress=progress, sidechain=sidechain)
             prev_key = key
 
             def get_pitch(mono, p, scope=scope, pid=pid, prev=prev_key, env=env):
@@ -93,7 +95,7 @@ class Mixer:
         bypass = snap["bypass_all"]
         tracks = snap["tracks"]
         master = snap["master"]
-        n_audio = max([0 if t["audio"] is None else t["audio"].shape[1] for t in tracks] + [0])
+        n_audio = max([0 if t["audio"] is None else t["start"] + t["audio"].shape[1] for t in tracks] + [0])
         if n_audio == 0:
             return MixResult(out=np.zeros((2, 0), np.float32), sr=sr)
         tail = 0
@@ -109,7 +111,10 @@ class Mixer:
         mix_key_parts = []
         result = MixResult(out=np.zeros((2, 0), np.float32), sr=sr)
 
-        for t in tracks:
+        sc_sum = np.zeros(N)           # голос для sidechain (Unmasker на дорожках с музыкой)
+        sc_parts = []
+        ordered = [t for t in tracks if t["kind"] != "audio"] + [t for t in tracks if t["kind"] == "audio"]
+        for t in ordered:
             if cancel is not None and cancel():
                 raise InterruptedError
             live_ids.update(p["id"] for p in t["plugins"])
@@ -117,10 +122,11 @@ class Mixer:
                 continue
             a = t["audio"]
             x = np.zeros((a.shape[0], N))
-            x[:, : a.shape[1]] = a
-            key = _k("t", t["audio_id"], N, sr)
+            x[:, t["start"]: t["start"] + a.shape[1]] = a
+            key = _k("t", t["audio_id"], t["start"], N, sr)
             res: dict = {}
-            x, key = self._run_chain(("t", t["id"]), x, key, t["plugins"], sr, bypass, cancel, progress, res)
+            x, key = self._run_chain(("t", t["id"]), x, key, t["plugins"], sr, bypass, cancel, progress, res,
+                                     sidechain=sc_sum if t["kind"] == "audio" else None, sc_key=_k(sc_parts))
             audible = (not t["mute"]) and ((not any_solo) or t["solo"])
             g = 10.0 ** (t["vol_db"] / 20.0)
             pan = float(t["pan"])
@@ -142,6 +148,9 @@ class Mixer:
             if audible:
                 mix += y
                 mix_key_parts.append((t["id"], key, t["vol_db"], t["pan"]))
+                if t["kind"] != "audio":
+                    sc_sum += y.mean(axis=0)
+                    sc_parts.append((t["id"], key, t["vol_db"], t["pan"]))
 
         live_ids.update(p["id"] for p in master["plugins"])
         mkey = _k("m", N, mix_key_parts)
@@ -168,11 +177,11 @@ class Mixer:
         if t is None or t["audio"] is None:
             return None
         tail = 0 if snap["bypass_all"] else _chain_tail(t["plugins"], sr)
-        n_audio = max([0 if q["audio"] is None else q["audio"].shape[1] for q in snap["tracks"]] + [0])
+        n_audio = max([0 if q["audio"] is None else q["start"] + q["audio"].shape[1] for q in snap["tracks"]] + [0])
         N = n_audio + tail
         a = t["audio"]
         x = np.zeros((a.shape[0], N))
-        x[:, : a.shape[1]] = a
-        key = _k("t", t["audio_id"], N, sr)
+        x[:, t["start"]: t["start"] + a.shape[1]] = a
+        key = _k("t", t["audio_id"], t["start"], N, sr)
         x, _ = self._run_chain(("t", t["id"]), x, key, t["plugins"], sr, snap["bypass_all"], cancel, progress, {})
         return x
